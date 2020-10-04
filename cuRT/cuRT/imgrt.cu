@@ -85,10 +85,10 @@ struct Ray
 	Vec3 o; // origin
 	Vec3 d; // direction
 	mutable float t;
+	float tMin;
+	float tMax;
 
-	Vec3 closestHitPoint;
-
-	__host__ __device__ Ray(const Vec3 &o_, const Vec3 &d_) : o(o_), d(d_), t(INT_MAX), closestHitPoint(Vec3(INT_MAX, INT_MAX, INT_MAX)) {}
+	__host__ __device__ Ray(const Vec3 &o_, const Vec3 &d_) : o(o_), d(d_), t(INT_MAX), tMin(0.002), tMax(INT_MAX) {}
 };
 
 struct Sphere
@@ -121,7 +121,10 @@ struct Sphere
 		const float t0 = (-b + delta) / (2 * a);
 		const float t1 = (-b - delta) / (2 * a);
 		ray.t = (t0 < t1) ? t0 : t1;
-		return true;
+		if (ray.t >= ray.tMin && ray.t <= ray.tMax)
+			return true;
+		else
+			return false;
 	}
 };
 
@@ -145,12 +148,10 @@ struct Camera
 	__host__ __device__ Camera(const Vec3 &pos, const Vec3 &dir) : position(pos), direction(dir) {}
 };
 
-
 __device__ Vec3 colorModulate(const Vec3 &lightColor, const Vec3 &objectColor) // performs component wise multiplication for colors  
 {
 	return Vec3(lightColor.x * objectColor.x, lightColor.y * objectColor.y, lightColor.z * objectColor.z);
 }
-
 __device__ void clamp(Vec3 &col)
 {
 	col.x = (col.x > 1) ? 1 : (col.x < 0) ? 0 : col.x;
@@ -210,16 +211,16 @@ __global__ void initScene(int width, int height, Camera *camera, Sphere *sphere,
 		
 		// *sphere = new Sphere(Vec3(0.5 * width, 0.45 * height, 350), 25, blue);
 
-		sphere->center = Vec3(0.5 * width, 0.45 * height, 350);
-		sphere->radius = 200;
+		sphere->center = Vec3(0.5 * width, 0.45 * height, 1000);
+		sphere->radius = 400;
 		sphere->color = Vec3(1, 0, 0);
 	}
 }
 
 int main()
 {
-	int width = 1920;
-	int height = 1080;
+	int width = 3840;
+	int height = 2160;
 	int tx = 8;
 	int ty = 8;
 
