@@ -5,79 +5,85 @@
 #include "curand_kernel.h"
 
 #include <iostream>
+#include <chrono>
+#include <iomanip>
+#include <cstdint>
 #include <cuda.h>
 
+const int nThreads = 1024;
 
-__global__ void init_cuda_rand(curandState *stateX, curandState *stateY, unsigned long seed)
+void errorCheck(cudaError_t code, const char *func, const char *fileName, const int line)
 {
-	int idx = threadIdx.x;
-	curand_init(seed, idx, 0, stateX);
-	curand_init(seed, idx, 0, stateY);
+	if (code)
+	{
+		std::cerr << "CUDA error = " << (int)code << " in file: " <<
+			fileName << " function: " << func << " on line: " << line << "\n";
+		cudaDeviceReset();
+		exit(1);
+	}
 }
 
-__global__ void getRandom(curandState *globalStateX, curandState *globalStateY, float *d_randArrayX, float *d_randArrayY)
+#define cudaErrorCheck(arg) errorCheck( (arg), #arg, __FILE__, __LINE__ )
+
+
+__global__ void initRandState(curandState *randState, unsigned long seed)
 {
 	int idx = threadIdx.x;
-	curandState localStateX = globalStateX[idx];
-	curandState localStateY = globalStateY[idx];
-	float randValX = curand_uniform(&localStateX);
-	float randValY = curand_uniform(&localStateY);
-	d_randArrayX[idx] = randValX;
-	d_randArrayY[idx] = randValY;
-	globalStateX[idx] = localStateX;
-	globalStateY[idx] = localStateY;
+	curand_init(seed, idx, 0, &randState[idx]);
 }
 
-__global__ void calcPi(int *d_sampleArray, float *d_randArrayX, float *d_randArrayY, int samples)
+__global__ void calcPi(curandState *globalRandState, size_t *d_sampleArray, size_t samples)
 {
 	int idx = threadIdx.x;
 	float x = 0, y = 0;
-	int count = 0;
-	for (int i = 0; i < samples * samples; i++)
+	size_t count = 0;
+	size_t max = (samples * samples) / nThreads;
+	curandState localState = globalRandState[idx];
+	for (size_t i = 0; i < max; ++i)
 	{
-		x = d_randArrayX[idx];
-		y = d_randArrayY[idx];
+		x = curand_uniform(&localState);
+		y = curand_uniform(&localState);
 		if (x * x + y * y <= 1)
 			count++;
 	}
+	globalRandState[idx] = localState;
 	d_sampleArray[idx] = count;
 }
 
 int main()
 {
-	const int ARRAY_SIZE = 128;
-	const int ARRAY_BYTES = ARRAY_SIZE * sizeof(int);
+	size_t *h_samples = new size_t[nThreads];
+	size_t samples;
 
-	int h_samples[ARRAY_SIZE];
-	int samples = 1000;
+	std::cout << "No. of samples: " << std::endl;
+	std::cin >> samples;	
 	
-	curandState *d_randStatesX;
-	curandState *d_randStatesY;
-	float *d_randArrayX;
-	float *d_randArrayY;
-	int *d_sampleArray;
+	curandState *d_randState;
+	size_t *d_sampleArray;
 
-	cudaMalloc((void**)&d_randArrayX, ARRAY_SIZE * sizeof(float));
-	cudaMalloc((void**)&d_randArrayY, ARRAY_SIZE * sizeof(float));
-	cudaMalloc((void**)&d_randStatesX, ARRAY_SIZE * sizeof(curandState));
-	cudaMalloc((void**)&d_randStatesY, ARRAY_SIZE * sizeof(curandState));
-	cudaMalloc((void**)&d_sampleArray, ARRAY_BYTES);
+	cudaErrorCheck(cudaMalloc((void**)&d_randState, nThreads * sizeof(curandState)));
+	cudaErrorCheck(cudaMalloc((void**)&d_sampleArray, nThreads * sizeof(size_t)));
 
-	init_cuda_rand <<<1, ARRAY_SIZE>>> (d_randStatesX, d_randStatesY, time(NULL));
-	getRandom <<<1, ARRAY_SIZE>>> (d_randStatesX, d_randStatesY, d_randArrayX, d_randArrayY);
-	calcPi <<<1, ARRAY_SIZE>>> (d_sampleArray, d_randArrayX, d_randArrayY, samples);
+	auto start = std::chrono::high_resolution_clock::now();
+	initRandState <<<1, nThreads>>> (d_randState, time(NULL));
+	calcPi <<<1, nThreads>>> (d_randState, d_sampleArray, samples);
 
-	cudaMemcpy(h_samples, d_sampleArray, ARRAY_BYTES, cudaMemcpyDeviceToHost);
+	cudaErrorCheck(cudaDeviceSynchronize());
+	cudaErrorCheck(cudaMemcpy(h_samples, d_sampleArray, nThreads * sizeof(size_t), cudaMemcpyDeviceToHost));
 
-	long s = 0;
-	for (int i = 0; i < ARRAY_SIZE; i++)
+	size_t s = 0;
+	for (int i = 0; i < nThreads; i++)
 		s += h_samples[i];
 
-	cudaFree(d_randArrayX);
-	cudaFree(d_randArrayY);
-	cudaFree(d_randStatesX);
-	cudaFree(d_randStatesY);
-	cudaFree(d_sampleArray);
+	long double pi = (4 * s) / (long double)(samples * samples);
+	auto stop = std::chrono::high_resolution_clock::now();
+	auto diff = std::chrono::duration_cast<std::chrono::milliseconds>(stop - start);
+	
 
-	std::cout << (4 * s) / (double)(ARRAY_SIZE * samples * samples) << std::endl;
+	std::cout << std::setprecision(12) << "Approx. value of Pi is: " << pi << std::endl;
+	std::cout << "\nTime taken is " << diff.count() << " milliseconds." << std::endl;
+
+	cudaErrorCheck(cudaFree(d_randState));
+	cudaErrorCheck(cudaFree(d_sampleArray));
+	delete[] h_samples;
 }
