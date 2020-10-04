@@ -21,7 +21,6 @@ void errorCheck(cudaError_t code, const char *func, const char *fileName, const 
 	}
 }
 
-
 #define cudaErrorCheck(arg) errorCheck( (arg), #arg, __FILE__, __LINE__ )
 
 struct Vec3
@@ -86,21 +85,28 @@ struct Ray
 	Vec3 d; // direction
 	mutable float t;
 	float tMin;
-	float tMax;
+	mutable float tMax;
 
-	__host__ __device__ Ray(const Vec3 &o_, const Vec3 &d_) : o(o_), d(d_), t(INT_MAX), tMin(0.002), tMax(INT_MAX) {}
+	__host__ __device__ Ray(const Vec3 &o_, const Vec3 &d_) : o(o_), d(d_), t(INT_MAX), tMin(0.1), tMax(INT_MAX) {}
 };
 
-struct Sphere
+struct Geometry
+{
+	Vec3 color;
+
+	__host__ __device__ virtual bool intersects(const Ray &ray) const = 0;
+	__host__ __device__ virtual Vec3 getNormal(const Vec3 &point) const = 0;
+};
+
+struct Sphere : public Geometry
 {
 	Vec3 center;
 	float radius;
-	Vec3 color;
 
-	bool hasBeenHit;
-	float distanceToCamera;
-
-	__host__ __device__ Sphere(const Vec3 &c, const float &rad, const Vec3 &col) : center(c), radius(rad), color(col), hasBeenHit(false), distanceToCamera(0) {}
+	__host__ __device__ Sphere(const Vec3 &c, const float &rad, const Vec3 &col) : center(c), radius(rad)
+	{
+		color = col;
+	}
 
 	__host__ __device__ Vec3 getNormal(const Vec3 &point) const // returns the surface normal at a point
 	{
@@ -122,7 +128,43 @@ struct Sphere
 		const float t1 = (-b - delta) / (2 * a);
 		ray.t = (t0 < t1) ? t0 : t1;
 		if (ray.t >= ray.tMin && ray.t <= ray.tMax)
+		{
+			ray.tMax = ray.t;
 			return true;
+		}
+		else
+			return false;
+	}
+};
+
+struct Plane : public Geometry
+{
+	Vec3 normal; // normal of the plane
+	Vec3 point; // a point on the plane
+
+
+	__host__ __device__ Plane(const Vec3 &n, const Vec3 &p, const Vec3 &col) : normal(n), point(p)
+	{
+		color = col;
+	}
+
+	__host__ __device__ Vec3 getNormal(const Vec3 &point) const
+	{
+		return normal;
+	}
+
+	__host__ __device__ bool intersects(const Ray &ray) const
+	{
+		const double eps = 1e-4;
+		double parameter = ray.d % normal;
+		if (fabs(parameter) < eps) // ray is parallel to the plane
+			return false;
+		ray.t = ((point - ray.o) % normal) / parameter;
+		if (ray.t >= ray.tMin && ray.t <= ray.tMax)
+		{
+			ray.tMax = ray.t;
+			return true;
+		}
 		else
 			return false;
 	}
@@ -159,23 +201,42 @@ __device__ void clamp(Vec3 &col)
 	col.z = (col.z > 1) ? 1 : (col.z < 0) ? 0 : col.z;
 }
 
-__device__ Vec3 getPixelColor(Ray &cameraRay, const Sphere *sphere, const Light *light)
+__device__ Vec3 getPixelColor(Ray &cameraRay, Geometry **scene, int sceneSize, const Light *light)
 {
 	Vec3 pixelColor;
 	Vec3 white(1, 1, 1);
-	if (sphere->intersects(cameraRay))
+	bool hitStatus = false;
+	int hitIndex = 0;
+	for (int i = 0; i < sceneSize; ++i)
 	{
-		Vec3 surf = cameraRay.o + cameraRay.d * cameraRay.t; // point of intersection
+		if (scene[i]->intersects(cameraRay))
+		{
+			hitStatus = true;		
+			hitIndex = i;
+		}
+	}
+
+	if (hitStatus)
+	{
+		Vec3 surf = cameraRay.o + cameraRay.d * cameraRay.tMax; // point of intersection
 		Vec3 L = (light->position - surf).getNormalized();
-		Vec3 N = sphere->getNormal(surf).getNormalized();
+
+
+		// check for shadows
+		Ray shadowRay(surf, L);
+		for (int i = 0; i < sceneSize; ++i)
+			if (scene[i]->intersects(shadowRay))
+				return pixelColor;
+
+		Vec3 N = scene[hitIndex]->getNormal(surf).getNormalized();
 		float diffuse = L.dot(N);
-		pixelColor = (colorModulate(light->color, sphere->color) + white * diffuse) * light->intensity;
+		pixelColor = (colorModulate(light->color, scene[hitIndex]->color) + white * diffuse) * light->intensity;
 		clamp(pixelColor);
 	}
 	return pixelColor;
 }
 
-__global__ void render(Vec3 *fb, int width, int height, const Camera *camera, const Sphere *sphere, const Light *light)
+__global__ void render(Vec3 *fb, int width, int height, const Camera *camera, Geometry **scene, int sceneSize, const Light *light)
 {
 	int x = (blockIdx.x * blockDim.x) + threadIdx.x;
 	int y = (blockIdx.y * blockDim.y) + threadIdx.y;
@@ -183,44 +244,37 @@ __global__ void render(Vec3 *fb, int width, int height, const Camera *camera, co
 		return;
 	int index = y * width + x;
 	Ray cameraRay(Vec3(x, y, 0), camera->direction); // camera ray from each pixel 
-	fb[index] = getPixelColor(cameraRay, sphere, light);
-
-	// fb[index].x = x / (float)width;
-	// fb[index].y = y / (float)height;
-	// fb[index].z = (fb[index].x + fb[index].y) / 2;
+	fb[index] = getPixelColor(cameraRay, scene, sceneSize, light);
 }
 
-__global__ void initScene(int width, int height, Camera *camera, Sphere *sphere, Light *light)
+__global__ void initScene(int width, int height, Camera *camera, Geometry **scene, Light *light)
 {
 	Vec3 white(1, 1, 1);
 	Vec3 blue(0, 0, 1);
 	if (threadIdx.x == 0 && blockIdx.x == 0)
 	{
-		// *light = new Light(Vec3(0.8 * width, 0.25 * height, 100), 1, white, 0.5);
-		
+		// light = new Light(Vec3(0.8 * width, 0.25 * height, 100), 1, white, 0.5);
+		// camera = new Camera(Vec3(0.5 * width, 0.5 * height, 0), Vec3(0, 0, 1));
+
 		light->position = Vec3(0.8 * width, 0.25 * height, 100);
 		light->radius = 1;
 		light->color = Vec3(1, 1, 1);
 		light->intensity = 0.5;
-		
-
-		// camera = new Camera(Vec3(0.5 * width, 0.5 * height, 0), Vec3(0, 0, 1));
 
 		camera->position = Vec3(0.5 * width, 0.5 * height, 0);
 		camera->direction = Vec3(0, 0, 1);
-		
-		// *sphere = new Sphere(Vec3(0.5 * width, 0.45 * height, 350), 25, blue);
 
-		sphere->center = Vec3(0.5 * width, 0.45 * height, 1000);
-		sphere->radius = 400;
-		sphere->color = Vec3(1, 0, 0);
+		scene[0] = new Sphere(Vec3(0.5 * width, 0.45 * height, 1000), 100, Vec3(1, 0, 0));
+		scene[1] = new Sphere(Vec3(0.65 * width, 0.2 * height, 600), 50, Vec3(0, 0, 1));
+		scene[2] = new Plane(Vec3(0, 0, -1), Vec3(0.5 * width, 0.5 * height, 1500), Vec3(1, 1, 0));
+		scene[3] = new Sphere(Vec3(0.5 * width, 0.52 * height, 700), 35, Vec3(0, 1, 1));
 	}
 }
 
 int main()
 {
-	int width = 3840;
-	int height = 2160;
+	int width = 2560;
+	int height = 1440;
 	int tx = 8;
 	int ty = 8;
 
@@ -234,9 +288,10 @@ int main()
 	const Vec3 magenta(1, 0, 1);
 	const Vec3 yellow(1, 1, 0);
 
-	Light *light; //  (Vec3(0.8 * width, 0.25 * height, 100), 1, white, 0.5); // white scene light
-	Camera *camera; // (Vec3(0.5 * width, 0.5 * height, 0), Vec3(0, 0, 1)); // scene camera
-	Sphere *sphere; //  (Vec3(0.5 * width, 0.45 * height, 350), 25, blue); // blue sphere
+	Light *light; 
+	Camera *camera;
+	Geometry **scene;
+	int sceneSize = 4;
 
 	int numPixels = width * height;
 	size_t fbSize = numPixels * sizeof(Vec3);
@@ -245,14 +300,14 @@ int main()
 	cudaErrorCheck(cudaMallocManaged((void**)&fb, fbSize));
 	cudaErrorCheck(cudaMallocManaged((void**)&light, sizeof(Light)));
 	cudaErrorCheck(cudaMallocManaged((void**)&camera, sizeof(Camera)));
-	cudaErrorCheck(cudaMallocManaged((void**)&sphere, sizeof(Sphere)));
+	cudaErrorCheck(cudaMallocManaged((void**)&scene, sizeof(Geometry*)));
 	
 	dim3 threadsPerBlock(tx, ty);
 	dim3 numBlocks(width / threadsPerBlock.x, height / threadsPerBlock.y);
 
 	auto start = std::chrono::high_resolution_clock::now();
-	initScene << <1, 1>> > (width, height, camera, sphere, light);
-	render << <numBlocks, threadsPerBlock >> > (fb, width, height, camera, sphere, light);
+	initScene << <1, 1>> > (width, height, camera, scene, light);
+	render << <numBlocks, threadsPerBlock >> > (fb, width, height, camera, scene, sceneSize, light);
 	cudaErrorCheck(cudaGetLastError());
 	cudaErrorCheck(cudaDeviceSynchronize());
 	auto stop = std::chrono::high_resolution_clock::now();
@@ -267,5 +322,5 @@ int main()
 	cudaErrorCheck(cudaFree(fb));
 	cudaErrorCheck(cudaFree(light));
 	cudaErrorCheck(cudaFree(camera));
-	cudaErrorCheck(cudaFree(sphere));
+	cudaErrorCheck(cudaFree(scene));
 }
