@@ -194,6 +194,7 @@ __device__ Vec3 colorModulate(const Vec3 &lightColor, const Vec3 &objectColor) /
 {
 	return Vec3(lightColor.x * objectColor.x, lightColor.y * objectColor.y, lightColor.z * objectColor.z);
 }
+
 __device__ void clamp(Vec3 &col)
 {
 	col.x = (col.x > 1) ? 1 : (col.x < 0) ? 0 : col.x;
