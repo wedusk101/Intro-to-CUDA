@@ -346,6 +346,9 @@ int main(int argc, char* argv[])
 		}
 	}
 
+	if (argc == 1)
+		std::cout << "Arguments not provided. Using default values.\n";
+
 	// colors (R, G, B)
 	const Vec3 white(1, 1, 1);
 	const Vec3 black(0, 0, 0);
