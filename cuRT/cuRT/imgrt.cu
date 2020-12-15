@@ -9,6 +9,8 @@
 #include <climits>
 #include <cstdlib>
 #include <cuda.h>
+#include <cstring>
+
 
 void errorCheck(cudaError_t code, const char *func, const char *fileName, const int line)
 {
@@ -272,12 +274,77 @@ __global__ void initScene(int width, int height, Camera *camera, Geometry **scen
 	}
 }
 
-int main()
+int isNumber(char *input)
+{
+	int len = strlen(input);
+	for (int i = 0; i < len; ++i)
+		if (!isdigit(input[i]))
+			return 0;
+
+	return 1;
+}
+
+int main(int argc, char* argv[])
 {
 	int width = 2560;
 	int height = 1440;
 	int tx = 8;
 	int ty = 8;
+	char *arg;
+
+	// setup multithreading and benchmark parameters
+
+	int nBenchLoops = 1;
+	bool isBenchmark = false;
+
+	for (int i = 0; i < argc; i++) // process command line args
+	{
+		if (!strcmp(argv[i], "-bench")) // usage -bench numberLoops
+		{
+			isBenchmark = true;
+			if (i + 1 < argc)
+			{
+				if (isNumber(argv[i + 1]))
+					nBenchLoops = atoi(argv[i + 1]); // number of times to loop in benchmark mode
+				else
+				{
+					std::cout << "Invalid benchmark loop count provided. Using default value.\n";
+					nBenchLoops = 5;
+				}
+			}
+			else
+			{
+				std::cout << "Benchmark loop count not provided. Using default value.\n";
+				nBenchLoops = 5;
+			}
+		}
+
+		if (!strcmp(argv[i], "-width"))
+		{
+			if (i + 1 < argc)
+			{
+				if (isNumber(argv[i + 1]))
+					width = atoi(argv[i + 1]); 
+				else
+					std::cout << "Invalid image width provided. Using default value.\n";
+			}
+			else
+				std::cout << "Image width not provided. Using default value.\n";
+		}
+
+		if (!strcmp(argv[i], "-height"))
+		{
+			if (i + 1 < argc)
+			{
+				if (isNumber(argv[i + 1]))
+					height = atoi(argv[i + 1]);
+				else
+					std::cout << "Invalid image height provided. Using default value.\n";
+			}
+			else
+				std::cout << "Image height not provided. Using default value.\n";
+		}
+	}
 
 	// colors (R, G, B)
 	const Vec3 white(1, 1, 1);
@@ -307,10 +374,19 @@ int main()
 	dim3 numBlocks(width / threadsPerBlock.x, height / threadsPerBlock.y);
 
 	auto start = std::chrono::high_resolution_clock::now();
-	initScene << <1, 1>> > (width, height, camera, scene, light);
-	render << <numBlocks, threadsPerBlock >> > (fb, width, height, camera, scene, sceneSize, light);
-	cudaErrorCheck(cudaGetLastError());
-	cudaErrorCheck(cudaDeviceSynchronize());
+
+	if (isBenchmark)
+		std::cout << "\nRunning in benchmark mode. Looping " << nBenchLoops << " times.\n";
+	std::cout << "\nRendering...\n";
+
+	initScene << <1, 1 >> > (width, height, camera, scene, light);
+	for (int run = 0; run < nBenchLoops; run++)
+	{
+		render << <numBlocks, threadsPerBlock >> > (fb, width, height, camera, scene, sceneSize, light);
+		cudaErrorCheck(cudaGetLastError());
+		cudaErrorCheck(cudaDeviceSynchronize());
+	}
+
 	auto stop = std::chrono::high_resolution_clock::now();
 
 	std::ofstream out("result.ppm"); // creates a PPM image file for saving the rendered output
