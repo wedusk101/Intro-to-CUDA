@@ -1,5 +1,7 @@
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
+#include "curand.h"
+#include "curand_kernel.h"
 
 #include <fstream>
 #include <cmath>
@@ -63,6 +65,22 @@ struct Vec3
 	__host__ __device__ Vec3 operator/(const float &c) const // scalar division
 	{
 		return Vec3(x / c, y / c, z / c);
+	}
+
+	__host__ __device__ Vec3& operator+=(const Vec3 &v) // addition
+	{
+		x += v.x;
+		y += v.y;
+		z += v.z;
+		return *this;
+	}
+
+	__host__ __device__ Vec3& operator/=(const float &c) // scalar division
+	{
+		x /= c;
+		y /= c;
+		z /= c;
+		return *this;
 	}
 
 	__host__ __device__ float operator%(const Vec3 &v) const // dot product
@@ -190,6 +208,13 @@ struct Camera
 	// add a lower left corner for orientation
 
 	__host__ __device__ Camera(const Vec3 &pos, const Vec3 &dir) : position(pos), direction(dir) {}
+
+	__host__ __device__ Ray getRay(int x, int y, float rand) const
+	{
+		double offsetX = (float)x + rand;
+		double offsetY = (float)y + rand;
+		return Ray(Vec3(offsetX, offsetY, 0), direction);
+	}
 };
 
 __device__ Vec3 colorModulate(const Vec3 &lightColor, const Vec3 &objectColor) // performs component wise multiplication for colors  
@@ -234,20 +259,30 @@ __device__ Vec3 getPixelColor(Ray &cameraRay, Geometry **scene, int sceneSize, c
 		Vec3 N = scene[hitIndex]->getNormal(surf).getNormalized();
 		float diffuse = L.dot(N);
 		pixelColor = (colorModulate(light->color, scene[hitIndex]->color) + white * diffuse) * light->intensity;
-		clamp(pixelColor);
 	}
 	return pixelColor;
 }
 
-__global__ void render(Vec3 *fb, int width, int height, const Camera *camera, Geometry **scene, int sceneSize, const Light *light)
+__global__ void render(Vec3 *fb, int width, int height, int spp, const Camera *camera, Geometry **scene, int sceneSize, const Light *light, curandState *globalRandState)
 {
 	int x = (blockIdx.x * blockDim.x) + threadIdx.x;
 	int y = (blockIdx.y * blockDim.y) + threadIdx.y;
-	if ((x >= width) || (y >= height))
-		return;
+	int idx = threadIdx.x;
+	Vec3 pixelColor;
 	int index = y * width + x;
-	Ray cameraRay(Vec3(x, y, 0), camera->direction); // camera ray from each pixel 
-	fb[index] = getPixelColor(cameraRay, scene, sceneSize, light);
+	for (int i = 0; i < spp; i++)
+	{
+		curandState localState = globalRandState[idx];
+		float r = curand_uniform(&localState);
+		globalRandState[idx] = localState;
+		if ((x >= width) || (y >= height))
+			return;		
+		Ray cameraRay = camera->getRay(x, y, r);
+		pixelColor += getPixelColor(cameraRay, scene, sceneSize, light);		
+	}
+	pixelColor /= (float)spp;
+	clamp(pixelColor);
+	fb[index] = pixelColor;
 }
 
 __global__ void initScene(int width, int height, Camera *camera, Geometry **scene, Light *light)
@@ -274,6 +309,12 @@ __global__ void initScene(int width, int height, Camera *camera, Geometry **scen
 	}
 }
 
+__global__ void initRandState(curandState *randState, unsigned long seed)
+{
+	int idx = threadIdx.x;
+	curand_init(seed, idx, 0, &randState[idx]);
+}
+
 int isNumber(char *input)
 {
 	int len = strlen(input);
@@ -288,9 +329,10 @@ int main(int argc, char* argv[])
 {
 	int width = 2560;
 	int height = 1440;
+	int spp = 8;
 	int tx = 8;
 	int ty = 8;
-	char *arg;
+	int nThreads = 1024;
 
 	// setup multithreading and benchmark parameters
 
@@ -344,6 +386,19 @@ int main(int argc, char* argv[])
 			else
 				std::cout << "Image height not provided. Using default value.\n";
 		}
+
+		if (!strcmp(argv[i], "-spp"))
+		{
+			if (i + 1 < argc)
+			{
+				if (isNumber(argv[i + 1]))
+					spp = atoi(argv[i + 1]);
+				else
+					std::cout << "Invalid sample count provided. Using default value.\n";
+			}
+			else
+				std::cout << "Sample count not provided. Using default value.\n";
+		}
 	}
 
 	if (argc == 1)
@@ -363,11 +418,14 @@ int main(int argc, char* argv[])
 	Camera *camera;
 	Geometry **scene;
 	int sceneSize = 4;
-
+	
 	int numPixels = width * height;
 	size_t fbSize = numPixels * sizeof(Vec3);
 
 	Vec3 *fb;
+	curandState *d_randState;
+
+	cudaErrorCheck(cudaMallocManaged((void**)&d_randState, nThreads * sizeof(curandState)));
 	cudaErrorCheck(cudaMallocManaged((void**)&fb, fbSize));
 	cudaErrorCheck(cudaMallocManaged((void**)&light, sizeof(Light)));
 	cudaErrorCheck(cudaMallocManaged((void**)&camera, sizeof(Camera)));
@@ -382,10 +440,11 @@ int main(int argc, char* argv[])
 		std::cout << "\nRunning in benchmark mode. Looping " << nBenchLoops << " times.\n";
 	std::cout << "\nRendering...\n";
 
+	initRandState << <1, nThreads >> > (d_randState, time(NULL));
 	initScene << <1, 1 >> > (width, height, camera, scene, light);
 	for (int run = 0; run < nBenchLoops; run++)
 	{
-		render << <numBlocks, threadsPerBlock >> > (fb, width, height, camera, scene, sceneSize, light);
+		render << <numBlocks, threadsPerBlock >> > (fb, width, height, spp, camera, scene, sceneSize, light, d_randState);
 		cudaErrorCheck(cudaGetLastError());
 		cudaErrorCheck(cudaDeviceSynchronize());
 	}
